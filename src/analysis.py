@@ -15,7 +15,17 @@ from .config import (DEDUPE_EVENTS, LR_MAX_ITER, MONTHS, PANEL_FILE,
                      RANDOM_STATE, SESSION_GAP_SECONDS)
 
 
-def F_and_E_scalers(df: pd.DataFrame) -> dict:
+# ── 用户标签口径（单一事实来源）──
+# 基期已购用户里的高价值用户，再按 Activity 细分为"精准直购用户 / 深度互动用户"两个子类；
+# 这两个标签合起来就是本项目的"基期高价值用户"，也是跨月沉默标记的唯一判断对象。
+SEGMENT_EFFICIENT_VIP = '精准直购用户'
+SEGMENT_IMMERSIVE_VIP = '深度互动用户'
+HIGH_VALUE_SEGMENTS = (SEGMENT_EFFICIENT_VIP, SEGMENT_IMMERSIVE_VIP)
+# 跨月沉默的展示标签：只出现在展示用的 Final_Segment 里，绝不写回 User_Segment
+SILENT_SEGMENT_LABEL = '高价值跨月沉默用户'
+
+
+def F_and_A_scalers(df: pd.DataFrame) -> dict:
 
 
     cols = ['Pages_Viewed', 'Estimated_Time', 'Session_Count']
@@ -39,21 +49,22 @@ def F_and_E_scalers(df: pd.DataFrame) -> dict:
     return scalers_dict
 
 
-def Friction_and_Exploration(df: pd.DataFrame, scalers: dict | None = None) -> pd.DataFrame:
+def Friction_and_Activity(df: pd.DataFrame, scalers: dict | None = None) -> pd.DataFrame:
     """
-    构建探索度与摩擦指标，指标定义保持业务可解释。
+    构建活跃度与摩擦指标，指标定义保持业务可解释。
 
-    Exploration: 浏览页数、有效停留时长、会话数的对数标准化均值。
+    Activity: 浏览页数、有效停留时长、会话数的对数标准化均值。
     Friction: 加购但未购买的去重商品数（Cart_Products - Purchased_Products，截断≥0），
               度量“加购了却没买”的购买意图受阻（未购人群首购潜力识别用）。
-    已购人群的“高摩擦”不在此定义——它指跨月完全沉默（见 silent_buyer）。
+    已购人群的跨月沉默不在 Friction 口径内——它由 silent_buyer 以独立标记
+    High_Value_Silent_Flag 给出，既不写回 User_Segment，也不属于本函数的指标。
 
-    scalers：可选 dict（见 F_and_E_scalers）。为 None 时当月重新拟合
+    scalers：可选 dict（见 F_and_A_scalers）。为 None 时当月重新拟合
     """
 
     # 在副本上操作，避免污染调用方的 DataFrame
     out = df.copy()
-    # 参与 Exploration 的三个探索度原始指标列
+    # 参与 Activity 的三个原始指标列
     cols = ['Pages_Viewed', 'Estimated_Time', 'Session_Count']
     # z：依次存放三个指标标准化后的列（每列长度均为行数）
     z = []
@@ -72,10 +83,13 @@ def Friction_and_Exploration(df: pd.DataFrame, scalers: dict | None = None) -> p
             standardized = scalers[col].transform(col_values)
         # ravel() 把列向量展平成一维，方便最后按行求均值
         z.append(standardized.ravel())
-    # Exploration = 三个标准化分量的逐行均值（探索度综合分）
-    out['Exploration'] = np.mean(z, axis=0)
+    # Activity = 三个标准化分量的逐行均值（活跃度综合分）
+    out['Activity'] = np.mean(z, axis=0)
 
     # Friction = 加购去重商品数 - 购买去重商品数（"加购了却没买"的意图受阻），截断 ≥ 0
+    # 注：Cart_Products / Purchased_Products 都是"同一个月内 product_id 的去重计数"，
+    #     两者相减是计数差而非严格集合差（当月买了但从未加购的商品会被一并扣减，
+    #     负值再被 clip 抹平）。本项目沿用这一既有口径，本次重构不改动公式。
     friction_raw = out['Cart_Products'] - out['Purchased_Products']
     out['Friction'] = friction_raw.clip(lower=0)
     # Log_Friction：对摩擦计数做 log1p，供 GMM 阈值分层使用
@@ -188,17 +202,17 @@ def build_features(events: pd.DataFrame,
     recency_filled = recency_days.fillna(fallback_recency)
     features['Recency_Days'] = recency_filled.astype(int)
 
-    # 第 9 步：去掉中间列并叠加探索度/摩擦力指标
+    # 第 9 步：去掉中间列并叠加活跃度/摩擦力指标
     # Last_Purchase 只用于算 Recency_Days，之后不再需要
     feats = features.drop(columns='Last_Purchase')
 
     if return_scalers and scalers is None:
-        # 调用方要求返回标准化器且未传入：在特征表上拟合 Exploration 的三个标准化器
-        scalers = F_and_E_scalers(feats)
+        # 调用方要求返回标准化器且未传入：在特征表上拟合 Activity 的三个标准化器
+        scalers = F_and_A_scalers(feats)
 
 
-    # 叠加 Exploration / Friction / Log_Friction（scalers 传入时复用、不重拟合）
-    out = Friction_and_Exploration(feats, scalers=scalers)
+    # 叠加 Activity / Friction / Log_Friction（scalers 传入时复用、不重拟合）
+    out = Friction_and_Activity(feats, scalers=scalers)
     if return_scalers:
         # 队列迁移场景：返回 (特征表, 标准化器)
         return out, scalers
@@ -259,11 +273,12 @@ def build_user_segment(features: pd.DataFrame,
     - 未购用户按行为指标识别首购潜力；
     每个指标只在语义匹配的人群内计算。
 
-    未购人群：Exploration 与 Friction 的 GMM 阈值识别高潜力首购。
-    已购人群：高价值用户再按 Exploration 细分为深度互动 / 直购；
-    “高价值高摩擦用户”（= 跨月完全沉默）由 silent_buyer 结合观察月数据标记。
+    未购人群：Activity 与 Friction 的 GMM 阈值识别高潜力首购。
+    已购人群：高价值用户再按 Activity 细分为深度互动 / 直购；
+    跨月沉默由 silent_buyer 以独立标记 High_Value_Silent_Flag 给出（基期高价值用户在
+    观察月完全无行为），本函数不写回 User_Segment。
 
-    参数 thresholds：传入基期拟合的阈值字典（即F_and_E_scalers的输出结果）则冻结使用，为 None 时当月重新拟合。
+    参数 thresholds：传入基期拟合的阈值字典（即 F_and_A_scalers 的输出结果）则冻结使用，为 None 时当月重新拟合。
     """
     # 在副本上操作，避免污染传入的特征表
     df = features.copy()
@@ -302,30 +317,30 @@ def build_user_segment(features: pd.DataFrame,
         value_cut = float(value_index.quantile(0.75))
 
 
-        # 未购人群的探索度 / 加购摩擦阈值：各自 GMM 两成分交点
-        nonbuyer_exploration_cut = gmm(df.loc[unpurchased, 'Exploration'])
+        # 未购人群的活跃度 / 加购摩擦阈值：各自 GMM 两成分交点
+        nonbuyer_activity_cut = gmm(df.loc[unpurchased, 'Activity'])
         nonbuyer_friction_cut = gmm(df.loc[unpurchased, 'Log_Friction'])
     else:
         # 冻结阈值：沿用基期拟合的阈值重算标签（队列迁移分析，保证跨月标签可比）
         value_cut = thresholds['vip_value_index_cutoff']
-        nonbuyer_exploration_cut = thresholds['nonbuyer_exploration_cutoff']
+        nonbuyer_activity_cut = thresholds['nonbuyer_activity_cutoff']
         nonbuyer_friction_cut = thresholds['nonbuyer_log_friction_cutoff']
 
     # 高价值用户 = 已购且价值指数 ≥ 高价值线
     vip_mask = purchased & (df['Value_Index'] >= value_cut)
     if thresholds is None:
-        # 高价值用户内部再按探索度 GMM 交点细分（当月拟合）
-        vip_exploration_cut = gmm(df.loc[vip_mask, 'Exploration'])
+        # 高价值用户内部再按活跃度 GMM 交点细分（当月拟合）
+        vip_activity_cut = gmm(df.loc[vip_mask, 'Activity'])
     else:
-        # 冻结基期的高价值探索度阈值
-        vip_exploration_cut = thresholds['vip_exploration_cutoff']
+        # 冻结基期的高价值活跃度阈值
+        vip_activity_cut = thresholds['vip_activity_cutoff']
 
     # ── 3. 生成互斥人群标签：先全部置默认，再逐条覆盖 ──
     # 默认标签：普通浏览用户
     df['User_Segment'] = '普通浏览用户'
-    # 未购用户中，探索度与加购摩擦都过阈值 → 高潜力首购用户
+    # 未购用户中，活跃度与加购摩擦都过阈值 → 高潜力首购用户
     high_potential_mask = (unpurchased
-                           & (df['Exploration'] >= nonbuyer_exploration_cut)
+                           & (df['Activity'] >= nonbuyer_activity_cut)
                            & (df['Log_Friction'] >= nonbuyer_friction_cut))
     df.loc[high_potential_mask, 'User_Segment'] = '高潜力首购用户'
 
@@ -334,38 +349,70 @@ def build_user_segment(features: pd.DataFrame,
     df.loc[regular_buyer_mask, 'User_Segment'] = '常规已购用户'
 
     # 高价值用户先统一记为"直购用户"（下单干脆、不太深逛）
-    df.loc[vip_mask, 'User_Segment'] = '高价值直购用户'
+    df.loc[vip_mask, 'User_Segment'] = SEGMENT_EFFICIENT_VIP
 
-    # 高价值且探索度也过阈值 → 覆盖为"高价值深度互动用户"
-    deep_interaction_mask = vip_mask & (df['Exploration'] >= vip_exploration_cut)
-    df.loc[deep_interaction_mask, 'User_Segment'] = '高价值深度互动用户'
+    # 高价值且活跃度也过阈值 → 覆盖为"深度互动用户"
+    deep_interaction_mask = vip_mask & (df['Activity'] >= vip_activity_cut)
+    df.loc[deep_interaction_mask, 'User_Segment'] = SEGMENT_IMMERSIVE_VIP
 
     # ── 4. 返回：分层结果 + 本次用到的全部阈值（供冻结复用）──
     metadata = {'vip_value_index_cutoff': value_cut,
-                'nonbuyer_exploration_cutoff': nonbuyer_exploration_cut,
+                'nonbuyer_activity_cutoff': nonbuyer_activity_cut,
                 'nonbuyer_log_friction_cutoff': nonbuyer_friction_cut,
-                'vip_exploration_cutoff': vip_exploration_cut}
+                'vip_activity_cutoff': vip_activity_cut}
     return df, metadata
 
 
 def silent_buyer(segmented: pd.DataFrame, active_user_ids) -> pd.DataFrame:
-    """
-    已购人群“跨月沉默”高摩擦标记（流失判定）。
+    """跨月沉默标记：基期高价值用户在观察月是否完全没有任何行为。
 
+    业务定义（与 Friction「加购未购买」严格区分）：
+    - User_Segment：基期确定的用户类型，本函数在任何情况下都不修改它；
+    - High_Value_Silent_Flag：只对基期高价值用户（HIGH_VALUE_SEGMENTS）判断——
+      观察月（紧接着基期的下一个月）完全没有浏览 / 加购 / 购买事件 → True；
+      观察月仍有任意行为 → False；非高价值用户恒为 False（表示"不属于该分析人群"，
+      而不是"一定活跃"）；
+    - Final_Segment：展示用的互斥标签，默认复制 User_Segment，
+      仅 High_Value_Silent_Flag == True 的用户标为「高价值跨月沉默用户」。
+
+    跨月沉默是流失风险的**观察信号**，不等于用户已经流失，也不能由观察月的
+    购买结果反向决定基期的用户类型。
+
+    参数
+    ----
+    segmented：基期分层结果（需含 user_id / User_Segment 两列）。
+    active_user_ids：观察月**有任意事件**（view / cart / purchase）的 user_id 可迭代集合。
+        必须是 id 的集合 / 序列；DataFrame 会被 set() 解释成列名，因此显式拒绝。
     """
+    # 入口校验：宁可报错，也不能在数据不可用时退化成"把所有高价值用户判为沉默"
+    if not isinstance(segmented, pd.DataFrame):
+        raise TypeError(f'segmented 需要是 DataFrame，收到 {type(segmented).__name__}。')
+    missing_cols = [c for c in ('user_id', 'User_Segment') if c not in segmented.columns]
+    if missing_cols:
+        raise ValueError(f'segmented 缺少必要列：{missing_cols}。')
+    if active_user_ids is None:
+        raise ValueError('未提供观察月活跃用户集合（active_user_ids=None），无法判定跨月沉默。')
+    if isinstance(active_user_ids, pd.DataFrame):
+        raise TypeError(
+            'active_user_ids 需要是 user_id 的可迭代集合，不能直接传 DataFrame'
+            '（set(DataFrame) 取到的是列名，会导致所有高价值用户被误判为沉默）。')
+    active = set(active_user_ids)
+    if len(active) == 0:
+        raise ValueError('观察月没有活跃用户，无法判断"谁没有出现"，拒绝将全部高价值用户标为沉默。')
+
     # 在副本上操作，避免影响调用方
     out = segmented.copy()
-    # 观察月里有任何事件的 user_id 集合（view / cart / purchase 都算"有活动"）
-    active = set(active_user_ids)
-    # 防御：观察月一个人都没出现时，无法判断"谁没出现"
-    if len(active) == 0:
-        raise ValueError('观察月没有活跃用户，无法判定沉默。')
 
-    # 找出高价值用户
-    vip_mask = out['User_Segment'].isin(['高价值直购用户', '高价值深度互动用户'])
-    # 高价值用户若在观察月完全没有事件 → 标记为"高价值高摩擦用户"（沉默/流失）
+    # 1) 基期高价值身份：只看基期 User_Segment，不用观察月数据反向决定
+    vip_mask = out['User_Segment'].isin(HIGH_VALUE_SEGMENTS)
+    # 2) 跨月沉默 = 基期高价值 且 观察月完全没有任何事件
     silence_mask = vip_mask & ~out['user_id'].isin(active)
-    out.loc[silence_mask, 'User_Segment'] = '高价值高摩擦用户'
+    out['High_Value_Silent_Flag'] = silence_mask
+
+    # 3) 展示用互斥标签：默认复制基期类型，只有"沉默的高价值用户"改名；
+    #    原始 User_Segment 保持基期分层结果不变
+    out['Final_Segment'] = out['User_Segment']
+    out.loc[silence_mask, 'Final_Segment'] = SILENT_SEGMENT_LABEL
     return out
 
 def proportion_ci(successes: int, total: int) -> tuple[float, float]:
@@ -440,23 +487,27 @@ def export_tracking(segmented: pd.DataFrame, path: Path | str | None = None,
     导出用户名单（全量分层名单 / A/B 候选抽样框）。
 
     默认导出**全部用户**的标签与概率分（运营按 User_Segment 筛选差异化策略：
-    高潜力首购→首购激励、高价值高摩擦→流失召回、深度互动→会员运营、
+    高潜力首购→首购激励、深度互动→会员运营、
     常规已购→复购唤醒、直购→快捷复购、普通浏览→潜力池）；
-    传入 segments 时只导出指定标签（如候选触达名单 = 高潜力首购 + 高价值高摩擦）。
+    传入 segments 时只导出指定的**基期标签**（如候选触达名单 = 高潜力首购）。
+
+    注意：跨月沉默（高价值跨月沉默用户）不是 User_Segment 的取值，而是 silent_buyer
+    给出的 High_Value_Silent_Flag 状态；要导出这类人群，请先按该标记过滤再调用本函数
+    （例如 export_tracking(flagged[flagged['High_Value_Silent_Flag']])）。
 
     排序层：名单附带未购用户首购概率分（First_Purchase_Prob / Rank / TopK_Flag）
     与已购用户复购概率分（Repurchase_Prob / Rank），运营可按预算取 rank ≤ k；
-    解释层：保留 User_Segment / Exploration / Friction 供策略话术使用。
+    解释层：保留 User_Segment / Activity / Friction 供策略话术使用。
     """
     # 导出名单所需的固定列集合（排序层 + 解释层字段）
-    cols = ['user_id', 'User_Segment', 'Exploration', 'Friction', 'Value_Index',
+    cols = ['user_id', 'User_Segment', 'Activity', 'Friction', 'Value_Index',
             'First_Purchase_Prob', 'First_Purchase_Rank', 'TopK_Flag',
             'Repurchase_Prob', 'Repurchase_Rank']
     if segments is None:
         # 默认：导出全部用户的标签与概率分（运营自行按 User_Segment 差异化运营）
         tracking = segmented.loc[:, cols].copy()
     else:
-        # 只导出指定标签的用户（如候选触达名单 = 高潜力首购 + 高价值高摩擦）
+        # 只导出指定基期标签的用户（跨月沉默请改按 High_Value_Silent_Flag 过滤）
         in_segments = segmented['User_Segment'].isin(segments)
         tracking = segmented.loc[in_segments, cols]
     if path is not None:
@@ -470,7 +521,7 @@ def _lr_features_matrix(frame: pd.DataFrame) -> np.ndarray:
 
     只用原始数据里的字段聚合——消费额 / 购买频次 / 最近购买天数，
     以及浏览页数 / 有效停留时长 / 会话数 / 加购去重商品数；
-    不使用项目自造的复合指标（Exploration / Friction / Value_Index）。
+    不使用项目自造的复合指标（Activity / Friction / Value_Index）。
 
     注：对未购用户，消费 / 频次恒为 0、近度为观察期兜底常量，标准化后恒为 0，
     对模型没有影响——因此一套特征可以服务所有人群，打分时无需判断人群。
@@ -705,7 +756,7 @@ def rolling_validation(month_tables: dict,
     滚动时间外验证（已购人群为跨月沉默定义）。
 
     - 实验一（未购人群）：基期月 t 分层 → 观察月 t+1 购买（2 月对）；
-    - 实验二（已购人群）：基期月 t 高价值买家 → 观察月 t+1 完全沉默（高价值高摩擦）
+    - 实验二（已购人群）：基期月 t 高价值买家 → 观察月 t+1 完全沉默（高价值跨月沉默）
        → 验证月 t+2 是否购买（3 月组，避免“沉默月 = 验证月”的循环定义）；
     返回 {'验证表': DataFrame}。
     month_tables：{月份: 该月表}（见 build_month_tables）。
@@ -748,20 +799,22 @@ def rolling_validation(month_tables: dict,
             if out_table is None or out_table.empty:
                 print(f'跳过 {base_m}→{obs_m}→{out_m}（验证月无数据）')
                 continue
-            # 用观察月的活跃用户标记"跨月完全沉默"的高价值用户（= 高价值高摩擦）
+            # 用观察月的活跃用户标记基期高价值用户的"跨月完全沉默"（不写回 User_Segment）
             obs_active = set(obs_table['user_id'])
             flagged = silent_buyer(base_table, obs_active)
-            # 沉默组：高价值高摩擦用户；对照组：观察月仍活跃的高价值用户
-            silent_vip = set(flagged.loc[flagged['User_Segment'] == '高价值高摩擦用户', 'user_id'])
-            active_vip_mask = flagged['User_Segment'].isin(['高价值直购用户', '高价值深度互动用户'])
+            # 沉默组：基期高价值 且 High_Value_Silent_Flag == True
+            silent_vip = set(flagged.loc[flagged['High_Value_Silent_Flag'], 'user_id'])
+            # 对照组：基期高价值 且 观察月仍有活动（flag == False）
+            active_vip_mask = (flagged['User_Segment'].isin(HIGH_VALUE_SEGMENTS)
+                               & ~flagged['High_Value_Silent_Flag'])
             active_vip = set(flagged.loc[active_vip_mask, 'user_id'])
             # 验证月买过的人
             out_buyers = set(out_table.loc[out_table['Purchase_Frequency'] > 0, 'user_id'])
             # 两组在验证月（t+2）的购买率对比（避免"沉默月 = 验证月"的循环定义）
             res2 = rolling_validation_rate_test(out_buyers, silent_vip, active_vip,
-                             f'{base_m}(基期)→{obs_m}(沉默)→{out_m}(验证) 高价值高摩擦')
+                             f'{base_m}(基期)→{obs_m}(沉默)→{out_m}(验证) 高价值跨月沉默')
             row2 = {'训练月': base_m, '沉默月': obs_m, '验证月': out_m,
-                    '实验': '高价值高摩擦(沉默)'}
+                    '实验': '高价值跨月沉默'}
             # 把 rolling_validation_rate_test 返回的各列指标并入这一行
             row2.update(res2)
             rate_rows.append(row2)
@@ -797,8 +850,8 @@ def cohort_migration(panel: pd.DataFrame, base_month: str,
     if base_events is None or base_events.empty:
         raise ValueError(f'基期月 {base_month} 没有数据。')
 
-    # ── 基期：拟合阈值 + 拟合 Exploration 标准化器 ──
-    # 标准化器"冻结"给后续月复用——否则每月重新标准化会让 Exploration 的"尺子"
+    # ── 基期：拟合阈值 + 拟合 Activity 标准化器 ──
+    # 标准化器"冻结"给后续月复用——否则每月重新标准化会让 Activity 的"尺子"
     # 每月漂移、破坏跨月可比（那就只冻结了阈值数值、没冻结尺子本身）
     feats_base, scalers = build_features(base_events, base_events['event_time'].max(),
                                          return_scalers=True)
