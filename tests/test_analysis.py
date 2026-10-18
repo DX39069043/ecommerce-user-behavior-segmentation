@@ -173,7 +173,7 @@ class TestSegmentUsers(unittest.TestCase):
         seg, meta = build_user_segment(feats)
         self.assertEqual(len(seg), len(feats))
         self.assertTrue(seg['User_Segment'].isin(
-            ['高潜力首购用户', '普通浏览用户', '常规已购用户', '精准直购用户',
+            ['高潜力转化用户', '普通浏览用户', '常规已购用户', '精准直购用户',
              '深度互动用户']).all())
         for key in ['vip_value_index_cutoff', 'nonbuyer_activity_cutoff',
                     'nonbuyer_log_friction_cutoff', 'vip_activity_cutoff']:
@@ -189,7 +189,7 @@ class TestSilentBuyerFlag(unittest.TestCase):
         self.base = pd.DataFrame({
             'user_id': [1, 2, 3, 4, 5, 6],
             'User_Segment': ['精准直购用户', '深度互动用户', '精准直购用户',
-                             '普通浏览用户', '常规已购用户', '高潜力首购用户'],
+                             '普通浏览用户', '常规已购用户', '高潜力转化用户'],
         })
         # 观察月事件：2 只浏览、2 又购买、5 只加购；1、3、4、6 完全没出现
         self.obs_events = pd.DataFrame({
@@ -261,7 +261,7 @@ class TestSilentBuyerFlag(unittest.TestCase):
         # 场景 10：Final_Segment 只在沉默高价值用户上改名，基期标签不受影响
         out = silent_buyer(self.base, self._active_ids())
         expected = ['高价值跨月沉默用户', '深度互动用户', '高价值跨月沉默用户',
-                    '普通浏览用户', '常规已购用户', '高潜力首购用户']
+                    '普通浏览用户', '常规已购用户', '高潜力转化用户']
         self.assertEqual(out['Final_Segment'].tolist(), expected)
         self.assertEqual(out['Final_Segment'].tolist().count(SILENT_SEGMENT_LABEL), 2)
         # 未沉默的高价值用户 Final_Segment 仍是原基期标签
@@ -423,8 +423,8 @@ class TestLRPredictRank(unittest.TestCase):
         flagged['TopK_Flag'] = np.nan
         flagged['Repurchase_Prob'] = np.nan
         flagged['Repurchase_Rank'] = np.nan
-        cand = export_tracking(flagged, segments=['高潜力首购用户'])
-        self.assertTrue(set(cand['User_Segment']) <= {'高潜力首购用户'})
+        cand = export_tracking(flagged, segments=['高潜力转化用户'])
+        self.assertTrue(set(cand['User_Segment']) <= {'高潜力转化用户'})
         self.assertLess(len(cand), len(flagged))
         # 跨月沉默人群：先按标记筛出，再导出（User_Segment 里不再有这个取值）
         silent_rows = flagged[flagged['High_Value_Silent_Flag']]
@@ -449,7 +449,7 @@ class TestRollingValidation(unittest.TestCase):
         res = rolling_validation(tables, months)
         rates = res['验证表']
         # 实验一：3 个月对（2 月窗口）；实验二：2 个月组（基期→沉默→验证，3 月窗口）
-        exp1 = rates[rates['实验'] == '高潜力首购']
+        exp1 = rates[rates['实验'] == '高潜力转化']
         exp2 = rates[rates['实验'] == '高价值跨月沉默']
         self.assertEqual(len(exp1), 3)
         self.assertEqual(len(exp2), 2)

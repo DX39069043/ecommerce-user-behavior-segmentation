@@ -18,6 +18,7 @@ from .config import (DEDUPE_EVENTS, LR_MAX_ITER, MONTHS, PANEL_FILE,
 # ── 用户标签口径（单一事实来源）──
 # 基期已购用户里的高价值用户，再按 Activity 细分为"精准直购用户 / 深度互动用户"两个子类；
 # 这两个标签合起来就是本项目的"基期高价值用户"，也是跨月沉默标记的唯一判断对象。
+SEGMENT_HIGH_POTENTIAL = '高潜力转化用户'   # 当月未购 + 高活跃 + 高加购摩擦
 SEGMENT_EFFICIENT_VIP = '精准直购用户'
 SEGMENT_IMMERSIVE_VIP = '深度互动用户'
 HIGH_VALUE_SEGMENTS = (SEGMENT_EFFICIENT_VIP, SEGMENT_IMMERSIVE_VIP)
@@ -55,7 +56,7 @@ def Friction_and_Activity(df: pd.DataFrame, scalers: dict | None = None) -> pd.D
 
     Activity: 浏览页数、有效停留时长、会话数的对数标准化均值。
     Friction: 加购但未购买的去重商品数（Cart_Products - Purchased_Products，截断≥0），
-              度量“加购了却没买”的购买意图受阻（未购人群首购潜力识别用）。
+              度量“加购了却没买”的购买意图受阻（未购人群转化潜力识别用）。
     已购人群的跨月沉默不在 Friction 口径内——它由 silent_buyer 以独立标记
     High_Value_Silent_Flag 给出，既不写回 User_Segment，也不属于本函数的指标。
 
@@ -270,10 +271,10 @@ def build_user_segment(features: pd.DataFrame,
     对用户进行精准分层
     以“是否已购”为首要业务边界：
     - 已购用户按价值指数上四分位识别高价值，
-    - 未购用户按行为指标识别首购潜力；
+    - 未购用户按行为指标识别转化潜力；
     每个指标只在语义匹配的人群内计算。
 
-    未购人群：Activity 与 Friction 的 GMM 阈值识别高潜力首购。
+    未购人群：Activity 与 Friction 的 GMM 阈值识别高潜力转化用户。
     已购人群：高价值用户再按 Activity 细分为深度互动 / 直购；
     跨月沉默由 silent_buyer 以独立标记 High_Value_Silent_Flag 给出（基期高价值用户在
     观察月完全无行为），本函数不写回 User_Segment。
@@ -338,11 +339,11 @@ def build_user_segment(features: pd.DataFrame,
     # ── 3. 生成互斥人群标签：先全部置默认，再逐条覆盖 ──
     # 默认标签：普通浏览用户
     df['User_Segment'] = '普通浏览用户'
-    # 未购用户中，活跃度与加购摩擦都过阈值 → 高潜力首购用户
+    # 未购用户中，活跃度与加购摩擦都过阈值 → 高潜力转化用户
     high_potential_mask = (unpurchased
                            & (df['Activity'] >= nonbuyer_activity_cut)
                            & (df['Log_Friction'] >= nonbuyer_friction_cut))
-    df.loc[high_potential_mask, 'User_Segment'] = '高潜力首购用户'
+    df.loc[high_potential_mask, 'User_Segment'] = SEGMENT_HIGH_POTENTIAL
 
     # 已购但价值指数未达高价值线 → 常规已购用户
     regular_buyer_mask = purchased & ~vip_mask
@@ -451,7 +452,7 @@ def rolling_validation_rate_test(purchased_ids: set,
     # 两组总人数
     n_a = len(treatment_ids)
     n_b = len(control_ids)
-    # 从标题里取组名（title 形如 "2019-10→2019-11 高潜力首购"）
+    # 从标题里取组名（title 形如 "2019-10→2019-11 高潜力转化"）
     group_name = title.split('：')[0]
     if n_a == 0 or n_b == 0:
         # 空组无法计算比率与检验（滚动验证中某月可能没有该人群），返回 NaN 占位
@@ -487,15 +488,15 @@ def export_tracking(segmented: pd.DataFrame, path: Path | str | None = None,
     导出用户名单（全量分层名单 / A/B 候选抽样框）。
 
     默认导出**全部用户**的标签与概率分（运营按 User_Segment 筛选差异化策略：
-    高潜力首购→首购激励、深度互动→会员运营、
+    高潜力转化→转化激励、深度互动→会员运营、
     常规已购→复购唤醒、直购→快捷复购、普通浏览→潜力池）；
-    传入 segments 时只导出指定的**基期标签**（如候选触达名单 = 高潜力首购）。
+    传入 segments 时只导出指定的**基期标签**（如候选触达名单 = 高潜力转化）。
 
     注意：跨月沉默（高价值跨月沉默用户）不是 User_Segment 的取值，而是 silent_buyer
     给出的 High_Value_Silent_Flag 状态；要导出这类人群，请先按该标记过滤再调用本函数
     （例如 export_tracking(flagged[flagged['High_Value_Silent_Flag']])）。
 
-    排序层：名单附带未购用户首购概率分（First_Purchase_Prob / Rank / TopK_Flag）
+    排序层：名单附带未购用户的次月购买预测概率（First_Purchase_Prob / Rank / TopK_Flag）
     与已购用户复购概率分（Repurchase_Prob / Rank），运营可按预算取 rank ≤ k；
     解释层：保留 User_Segment / Activity / Friction 供策略话术使用。
     """
@@ -778,15 +779,15 @@ def rolling_validation(month_tables: dict,
             continue
 
         # ── 实验一（未购人群）：基期特征 → 观察月购买 ──
-        # 规则人群 = 高潜力首购用户；对照组 = 普通浏览用户（基期表里已带标签）
-        potential = set(base_table.loc[base_table['User_Segment'] == '高潜力首购用户', 'user_id'])
+        # 规则人群 = 高潜力转化用户；对照组 = 普通浏览用户（基期表里已带标签）
+        potential = set(base_table.loc[base_table['User_Segment'] == SEGMENT_HIGH_POTENTIAL, 'user_id'])
         nonbuyer_control = set(base_table.loc[base_table['User_Segment'] == '普通浏览用户', 'user_id'])
         # 观察月买过的人（买过 ⇔ 该月表 Purchase_Frequency > 0）
         obs_buyers = set(obs_table.loc[obs_table['Purchase_Frequency'] > 0, 'user_id'])
         # 两组在观察月的购买率对比 + 显著性检验
         res1 = rolling_validation_rate_test(obs_buyers, potential, nonbuyer_control,
-                                            f'{base_m}→{obs_m} 高潜力首购')
-        row1 = {'训练月': base_m, '沉默月': '', '验证月': obs_m, '实验': '高潜力首购'}
+                                            f'{base_m}→{obs_m} 高潜力转化')
+        row1 = {'训练月': base_m, '沉默月': '', '验证月': obs_m, '实验': '高潜力转化'}
         # 把 rolling_validation_rate_test 返回的各列指标并入这一行
         row1.update(res1)
         rate_rows.append(row1)
